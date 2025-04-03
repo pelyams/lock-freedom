@@ -7,8 +7,8 @@ const HP_PER_THREAD: usize = 16;
 const SCAN_THRESHOLD: usize = 2 * HP_PER_THREAD;
 
 pub struct HazardPointerArray<T> {
-    p_array: [AtomicPtr<T>; MAX_THREADS * HP_PER_THREAD],
-    // '1' stands for ready-to-use slots (sub-arrays) in p_array
+    p_list: [AtomicPtr<T>; MAX_THREADS * HP_PER_THREAD],
+    // in this bitmap, 1's stand for ready-to-use slots (sub-arrays) in p_array
     thread_registry: AtomicU64,
 }
 
@@ -21,7 +21,7 @@ impl<T> HazardPointerArray<T> {
         let thread_registry = !0 >> (64 - MAX_THREADS);
 
         Self {
-            p_array: unsafe { std::mem::transmute(pointers) },
+            p_list: unsafe { std::mem::transmute(pointers) },
             thread_registry: AtomicU64::new(thread_registry),
         }
     }
@@ -60,7 +60,6 @@ pub struct HazardPointerGuard<'a, T> {
     array: &'a HazardPointerArray<T>,
     starting_idx: usize,
     available_indices: u64,
-
     d_list: Vec<T>,
 }
 
@@ -71,7 +70,7 @@ impl<T> HazardPointerGuard<T> {
         }
         let offset = self.available_indices.trailing_zeros() as usize;
         self.available_indices &= !(1u64 << offset);
-        self.array.p_array[self.starting_idx + offset].store(data, Ordering::Release);
+        self.array.p_list[self.starting_idx + offset].store(data, Ordering::Release);
         Ok(ProtectedPointer {
             ptr: data,
             index: offset,
@@ -85,7 +84,8 @@ impl<T> HazardPointerGuard<T> {
     ) {
         //release
         // populate d_list with a new node
-        self.d_list.push();
+        let retired_node = self.release(node);
+        self.d_list.push(retired_node);
         if self.d_list.len() > SCAN_THRESHOLD {
             self.scan();
         }
@@ -93,13 +93,21 @@ impl<T> HazardPointerGuard<T> {
 
     // turn this method public and get things hazard fr
     fn release(
-        &self,
+        &mut self,
         node: &ProtectedPointer<T>,
     ) -> * mut T {
         // extract & remove entry from p_lsit
+        self.array.p_list[self.starting_idx + node.index].store(core::ptr::null_mut(), Ordering::Release);
+        let released_ptr = node.ptr;
+
+        // hmm
+        core::mem::forget(node);
+
         // add return idx to self.indices
+        self.available_indices |= node.index as u64;
 
         //return extracted pointer
+        released_ptr
     }
 
     // here, we perform 'thread-local' scan
@@ -120,9 +128,10 @@ impl<T> Drop for HazardPointerGuard<T> {
     fn drop(&mut self) {
         //do clean_up in p_list
 
-        //self.scan()
 
+        self.scan();
         //fetch_sub hazard_pointer_array.thread_count
+        self.array.thread_registry.fetch_or(1 << (self.starting_idx / HP_PER_THREAD), Ordering::Relaxed);
 
     }
 }

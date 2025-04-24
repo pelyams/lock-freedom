@@ -59,6 +59,9 @@ impl<T> HazardPointerArray<T> {
     }
 }
 
+unsafe impl<T> Send for HazardPointerArray<T> {}
+// no Send impl for HazardPointerGuard since it is supposed for static usage
+
 pub struct HazardPointerGuard<'a, T> {
     array: &'a HazardPointerArray<T>,
     starting_idx: usize,

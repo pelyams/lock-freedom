@@ -29,8 +29,6 @@ impl<T> HazardPointerArray<T> {
     }
 
     pub fn register_thread(&self) -> Result<HazardPointerGuard<T>, RegisterThreadError> {
-        // вообще долбиться в цикле тоже не хочется, конечно
-        // мб следует как-то помечать забронированные индексы?
         loop {
             let thread_registry = self.thread_registry.load(Ordering::Relaxed);
             if thread_registry == 0 {
@@ -87,20 +85,32 @@ impl<T> HazardPointerGuard<'_, T> {
         })
     }
 
-    pub fn retire_node(&self, ptr: *mut T, index: usize) {
-        self.array.p_list[self.starting_idx + index]
+    pub fn unprotect(&self, protected_pointer: &ProtectedPointer<T>) {
+        self.array.p_list[self.starting_idx + protected_pointer.index]
             .store(core::ptr::null_mut(), Ordering::Release);
         let indices = self.available_indices.get();
-        self.available_indices.set(indices | (1u64 << index));
-        let mut d_list = self.d_list.borrow_mut();
-        d_list.push(ptr);
-        if d_list.len() > SCAN_THRESHOLD {
-            drop(d_list);
-            self.scan();
-        }
+        self.available_indices.set(indices | (1u64 << protected_pointer.index));
     }
 
-    pub fn retire_raw_pointer(&mut self, ptr: *mut T) {
+    // pub fn retire_node(&self, ptr: *mut T, index: usize) {
+    //     self.array.p_list[self.starting_idx + index]
+    //         .store(core::ptr::null_mut(), Ordering::Release);
+    //     let indices = self.available_indices.get();
+    //     self.available_indices.set(indices | (1u64 << index));
+    //     let mut d_list = self.d_list.borrow_mut();
+    //     d_list.push(ptr);
+    //     if d_list.len() > SCAN_THRESHOLD {
+    //         drop(d_list);
+    //         self.scan();
+    //     }
+    // }
+
+    pub fn retire_node(&self, protected_pointer: ProtectedPointer<T>) {
+        let ptr = unsafe { protected_pointer.into_raw()} ;
+        self.retire_raw_pointer(ptr);
+    }
+
+    pub fn retire_raw_pointer(&self, ptr: *mut T) {
         let mut d_list = self.d_list.borrow_mut();
         d_list.push(ptr);
         if d_list.len() > SCAN_THRESHOLD {
@@ -144,6 +154,11 @@ impl<T> HazardPointerGuard<'_, T> {
             })
             .collect();
     }
+
+    // just for the sake of completeness
+    pub fn unregister_thread(self) {
+        drop(self);
+    }
 }
 
 impl<'a, T> Drop for HazardPointerGuard<'a, T> {
@@ -167,14 +182,18 @@ impl<'a, T> ProtectedPointer<'a, T> {
     // caller must ensure the memory remains valid as long as needed
     // pointer must not be freed directly, only through retire_raw_pointer
     pub unsafe fn into_raw(self) -> *mut T {
+        // as protected pointer is consumed, guard automatically unprotects pointer
         let ptr = self.ptr;
-        self.guard.array.p_list[self.guard.starting_idx + self.index]
-            .store(std::ptr::null_mut(), Ordering::Release);
-        let indices = self.guard.available_indices.get();
-        self.guard
-            .available_indices
-            .set(indices | (1u64 << self.index));
-        std::mem::forget(self);
+
+
+        // self.guard.unprotect(&self);
+        // // self.guard.array.p_list[self.guard.starting_idx + self.index]
+        // //     .store(std::ptr::null_mut(), Ordering::Release);
+        // // let indices = self.guard.available_indices.get();
+        // // self.guard
+        // //     .available_indices
+        // //     .set(indices | (1u64 << self.index));
+        // std::mem::forget(self);
         ptr
     }
 }
@@ -188,7 +207,9 @@ impl<'a, T> std::ops::Deref for ProtectedPointer<'a, T> {
 
 impl<'a, T> Drop for ProtectedPointer<'a, T> {
     fn drop(&mut self) {
-        self.guard.retire_node(self.ptr, self.index);
+        // default behavior:
+        // remove pointer from p_list without any memory reclamation attempts
+        self.guard.unprotect(self);
     }
 }
 

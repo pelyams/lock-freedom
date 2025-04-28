@@ -1,17 +1,17 @@
-In this library, I'm continuing my personal diving into the world synchronization 
+In this library, I'm continuing my personal diving into the world of synchronization 
 
 [todo] (almost everything so far :) )
 
 Library will consist of lock-free building blocks:
-- Hazard Pointer (regular)
-- HP with Reference Count
-- HP (Pass-the-buck version)
-- RCU
+- Hazard Pointer (regular) ✅
+- HP with Reference Count ⛔️
+- HP (Pass-the-buck version) 🚧
+- RCU (single writer) 🚧
 
 And basic stuctures:
-- Treiber Stack
-- Michael-Scott Queue
-- Lock-free HashMap
-- Lock-free SkipList
-- Parking Lot
-- Sequence Lock
+- Treiber Stack 🚧
+- Michael-Scott Queue 🚧
+- Lock-free HashMap ⛔️
+- Lock-free SkipList ⛔️
+- Parking Lot ⛔️
+- Sequence Lock ⛔️

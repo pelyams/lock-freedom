@@ -1,8 +1,8 @@
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-use std::ops::{Deref};
-use std::collections::HashMap;
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::ops::Deref;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 static CONTROL_BIT: usize = 1;
 static RCU_ID: AtomicUsize = AtomicUsize::new(1);
@@ -15,9 +15,9 @@ thread_local! {
 pub struct Rcu<T: Sync> {
     /*
         since this is a single-writer RCU, there could be only 2 possible versions of
-        underlying data at a time. so, instead of having separate fields, we can have
+        underlying data at a time. so, instead of having two separate fields, we can have
         a combined value, that can both ensure consistency and simplify design:
-        current epoch value can be stored to the least significant byte of pointer,
+        current epoch value can be stored to the least significant bit of pointer,
         that is commonly out of use, unless it has alignment of 1. as an obvious drawback,
         we can't use T with alignment of 1. as a workaround to this drawback we can
         introduce some Padded wrapper type for T (not implemented here)
@@ -27,13 +27,13 @@ pub struct Rcu<T: Sync> {
         store previous pointer for safer memory reclamation in the next synchronize().
         this should solve an issue:
         if we try to free pointer from ptr_and_epoch right after updating its value,
-        we can fall into following case. imagine reader and writer are accessing rcu
-        simultaneously. currently there's no active 'readers', i.e. [0,0]. now reader thread
-        obtains the pointer, then scheduler preempts to writer. writer updates the value and runs
-        synchronize(). since reader hasn't updated 'readers' yet, writer is free to free the
-        previous pointer. now reader updates 'readers' and obtains a guard with a dangling pointer.
-        to rule out this risk, we delay previous pointer reclamation to the next syncronize()
-        invocation
+        we can fall into following case. consider the case: reader and writer are accessing rcu
+        simultaneously. currently there's no active 'readers' for current epoch. first, reader
+        thread obtains the pointer, then scheduler preempts to writer. writer updates the value+
+        epoch and runs synchronize(). since reader hasn't updated 'readers' yet, writer is free
+        to free the previous pointer. now reader updates 'readers' for previous epoch and obtains
+        a guard with a dangling pointer. to rule out this risk, we delay previous pointer
+        reclamation to the next synchronize() invocation
     */
     previous_ptr: *mut T,
     rcu_id: usize,
@@ -67,7 +67,7 @@ impl<T: Sync> Rcu<T> {
                 }
             } else {
                 self.readers[epoch].fetch_add(1, Ordering::Release);
-                rcu_nested_map.insert(self.rcu_id,[0,0]);
+                rcu_nested_map.insert(self.rcu_id, [0, 0]);
             }
             let nested = rcu_nested_map.get_mut(&self.rcu_id).unwrap();
             nested[epoch] += 1;
@@ -79,15 +79,20 @@ impl<T: Sync> Rcu<T> {
         }
     }
     pub fn update(&self, data: T) {
-        while self.is_writing.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err(){
-            // todo: backoff strategy
+        while self
+            .is_writing
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            // todo: backoff strategy (spin + park/futex-wait? .. )
         }
-        let epoch = (self.ptr_and_epoch.load(Ordering::Relaxed) as usize & CONTROL_BIT)
-            ^ CONTROL_BIT;
+        let epoch =
+            (self.ptr_and_epoch.load(Ordering::Relaxed) as usize & CONTROL_BIT) ^ CONTROL_BIT;
         self.synchronize(epoch);
         let new_data_ptr = Box::into_raw(Box::new(data));
-        let packed_ptr_and_epoch = (new_data_ptr as usize | epoch) as * mut T;
-        self.ptr_and_epoch.store(packed_ptr_and_epoch, Ordering::Release);
+        let packed_ptr_and_epoch = (new_data_ptr as usize | epoch) as *mut T;
+        self.ptr_and_epoch
+            .store(packed_ptr_and_epoch, Ordering::Release);
 
         self.is_writing.store(false, Ordering::Release);
     }
@@ -95,7 +100,7 @@ impl<T: Sync> Rcu<T> {
     fn synchronize(&self, sync_epoch: usize) {
         if !self.previous_ptr.is_null() {
             while self.readers[sync_epoch].load(Ordering::Acquire) != 0 {
-                //todo: backoff strategy
+                //todo: backoff strategy (spin + yield?)
             }
             unsafe { drop(Box::from_raw(self.previous_ptr)) };
         }
@@ -107,14 +112,14 @@ unsafe impl<T: Sync> Sync for Rcu<T> {}
 pub struct RcuReadGuard<'a, T: Sync> {
     rcu: &'a Rcu<T>,
     /*
-        raw pointer to current underlying data version
-        if we instead read ptr from Rcu reference, we may accidentally access an updated
-        pointer data and have different data versions:
-        1. reader A accesses data once: RCU -> RcuReadGuard -> rcu -> atomic ptr -> current
-        data version
-        2. writer B: RCU -> update(new_data) -> atomic ptr updates
-        3. reader A accesses second time: RcuReadGuard -> rcu -> atomic ptr -> newer data
-     */
+       raw pointer to current underlying data version
+       if we instead read ptr from rcu reference, we may accidentally access an updated
+       pointer data and have different data versions:
+       1. reader A accesses data once: RCU -> RcuReadGuard -> rcu -> atomic ptr -> current
+       data version
+       2. writer B: RCU -> update(new_data) -> atomic ptr updates
+       3. reader A accesses second time: RcuReadGuard -> rcu -> atomic ptr -> newer data
+    */
     ptr: *const T,
     // here, let be standalone, for clarity
     epoch: usize,
@@ -123,7 +128,7 @@ pub struct RcuReadGuard<'a, T: Sync> {
 impl<'a, T: Sync> Deref for RcuReadGuard<'a, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        // safe because reader count > 0 and pointer is valid when the guard was created.
+        // safe because reader count > 0 and pointer is valid when the guard was created
         unsafe { &*self.ptr }
     }
 }
@@ -150,7 +155,9 @@ impl<T: Sync> Drop for Rcu<T> {
         // this is safe, because RcuReadGuards, providing a reference to underlying data
         // wouldn't outlive rcu
         if !ptr.is_null() {
-            unsafe { drop(Box::from_raw(ptr)); }
+            unsafe {
+                drop(Box::from_raw(ptr));
+            }
         }
     }
 }

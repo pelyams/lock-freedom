@@ -4,13 +4,13 @@ In this library, I'm continuing my personal diving into the world of synchroniza
 
 Library will consist of lock-free building blocks:
 - Hazard Pointer (regular) ✅
-- HP with Reference Count ⛔️
 - HP (Pass-the-buck version) 🚧
-- RCU (single writer) 🚧
+- RCU (single writer) ✅
 
-And basic stuctures:
-- Treiber Stack 🚧
-- Michael-Scott Queue 🚧
+And basic structures:
+- Treiber Stack w/elimination backoff 🚧
+- Michael-Scott Queue (regular) 🚧
+- Michail-Scott Queue (optimistic version) 🚧
 - Lock-free HashMap ⛔️
 - Lock-free SkipList ⛔️
 - Parking Lot ⛔️

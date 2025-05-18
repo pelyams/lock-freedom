@@ -69,8 +69,8 @@ pub struct HazardPointerGuard<'a, T> {
 }
 
 impl<T> HazardPointerGuard<'_, T> {
-    // safety: it is user's duty to ensure that the pointer is valid 
-    // and that there's no concurrent modification or freeing of the pointer 
+    // safety: it is user's duty to ensure that the pointer is valid
+    // and that there's no concurrent modification or freeing of the pointer
     pub unsafe fn protect(&self, data_ptr: *mut T) -> Result<ProtectedPointer<T>, ProtectionError> {
         if data_ptr.is_null() {
             return Err(ProtectionError::NullPointer);
@@ -170,8 +170,15 @@ pub struct ProtectedPointer<'a, T> {
 }
 
 impl<'a, T> ProtectedPointer<'a, T> {
-    // unsafe fr!
-    // consumes protected pointer, unprotects it and returns underlying raw pointer
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr
+    }
+    
+    // safety: consumes protected pointer, unprotects it and returns underlying raw pointer
     // caller must ensure the memory remains valid as long as needed
     // pointer must not be freed directly, only through retire_raw_pointer
     pub unsafe fn into_raw(self) -> *mut T {
@@ -186,6 +193,12 @@ impl<'a, T> std::ops::Deref for ProtectedPointer<'a, T> {
     // should be safe if guarantees (no access outside protected pointers) are fulfilled🚬
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.ptr }
+    }
+}
+
+impl<'a , T> std::ops::DerefMut for ProtectedPointer<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.ptr }
     }
 }
 

@@ -1,6 +1,4 @@
-In this library, I'm continuing my personal diving into the world of synchronization 
-
-[todo] (almost everything so far :) )
+In this library, I've continued my personal diving into the world of synchronization 
 
 Library will consist of lock-free building blocks:
 - Hazard Pointer (regular) ✅
@@ -9,8 +7,8 @@ Library will consist of lock-free building blocks:
 
 And basic structures:
 - Treiber Stack w/elimination backoff 🚧
-- Michael-Scott Queue (regular) 🚧
-- Michail-Scott Queue (optimistic version) 🚧
+- Michael-Scott Queue (regular) ✅
+- Michael-Scott Queue (optimistic version) 🚧
 - Lock-free HashMap ⛔️
 - Lock-free SkipList ⛔️
 - Parking Lot ⛔️

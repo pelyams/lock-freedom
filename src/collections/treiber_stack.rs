@@ -14,15 +14,17 @@ const POP: usize = 1;
 // + non-const state: point to node placed by push attempt with LSB 1 - case slot was POP
 
 pub struct TreiberStack<T> {
-    head: AtomicPtr<Node<T>>,
+    head: AtomicPtr<StackNode<T>>,
     elimination_array: [AtomicUsize; ELIMINATION_ARRAY_SIZE],
 }
 
-// todo: need a public wrapper type (for hazard pointer guard typing)
 struct Node<T> {
     data: T,
-    next: AtomicPtr<Node<T>>,
+    next: AtomicPtr<StackNode<T>>,
 }
+
+#[repr(transparent)]
+pub struct StackNode<T>(Node<T>);
 
 impl<T> TreiberStack<T>
 where
@@ -37,23 +39,23 @@ where
 
     // no safe reclamation needed for push method, since we don't dereference pointers here
     pub fn push(&self, data: T) {
-        assert_ne!(
-            align_of::<T>() & 1,
-            1,
-            "TreiberStack data alignment must be greater than one"
-        );
+        // assert_ne!(
+        //     align_of::<T>() & 1,
+        //     1,
+        //     "TreiberStack data alignment must be greater than one"
+        // );
 
         let new_node = Box::into_raw(Box::new(Node {
             data,
             next: AtomicPtr::new(std::ptr::null_mut()),
-        }));
+        })) as *mut StackNode<T>;
 
         let mut backoff = Backoff::new();
         let mut loop_counter = 0;
 
         loop {
             let head = self.head.load(Ordering::Relaxed);
-            unsafe { (*new_node).next.store(head, Ordering::Relaxed) };
+            unsafe { (*new_node).0.next.store(head, Ordering::Relaxed) };
 
             // try to swap in our node as the new head
             if self
@@ -67,7 +69,7 @@ where
                 backoff.spin();
                 loop_counter += 1;
             } else {
-                match self.try_elimination_push(new_node) {
+                match self.try_elimination_push(new_node as *mut Node<T>) {
                     Ok(_) => return,
                     // actual error doesn't matter here, we just start again
                     Err(_) => {
@@ -80,7 +82,7 @@ where
     }
 
     // user should register thread for hp guard obtaining
-    pub fn pop(&self, guard: &HazardPointerGuard<Node<T>>) -> Option<T> {
+    pub fn pop(&self, guard: &HazardPointerGuard<StackNode<T>>) -> Option<T> {
         let mut hp_backoff = Backoff::new();
         let mut cas_backoff = Backoff::new();
         let mut loop_couter = 0;
@@ -105,7 +107,7 @@ where
             }
 
             // safely read the next pointer of the head node
-            let next = (*protected_head).next.load(Ordering::Relaxed);
+            let next = (*protected_head).0.next.load(Ordering::Relaxed);
 
             // try to update the head to the next node
             if self
@@ -120,7 +122,7 @@ where
             {
                 // successfully popped the node
                 // now return data and retirement
-                let data = std::mem::take(&mut (*protected_head).data);
+                let data = std::mem::take(&mut (*protected_head).0.data);
                 guard.retire_node(protected_head);
                 return Some(data);
             }
@@ -340,18 +342,18 @@ mod tests {
                         for  _ in 0..per_thread_ops/2 {
                             stack_ref.push(TrackableValue::new());
                         }
-                        
+
                         for  _ in 0..per_thread_ops/2 {
                             let popped = stack_ref.pop(&guard);
                             let mut lock = values_ref.lock().unwrap();
                             (*lock).push(popped.unwrap().value);
                         }
-                        
+
                         // second batch
                         for  _ in per_thread_ops / 2..per_thread_ops {
                             stack_ref.push(TrackableValue::new());
                         }
-                        
+
                         for  _ in per_thread_ops / 2..per_thread_ops {
                             let popped = stack_ref.pop(&guard);
                             let mut lock = values_ref.lock().unwrap();

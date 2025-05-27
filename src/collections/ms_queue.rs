@@ -5,14 +5,17 @@ use std::sync::atomic::{fence, AtomicPtr, Ordering};
 use crate::utils::backoff::Backoff;
 
 pub struct MSQueue<T> {
-    head: AtomicPtr<Node<T>>,
-    tail: AtomicPtr<Node<T>>,
+    head: AtomicPtr<QueueNode<T>>,
+    tail: AtomicPtr<QueueNode<T>>,
 }
 
-pub struct Node<T> {
+struct Node<T> {
     data: T,
-    next: AtomicPtr<Node<T>>,
+    next: AtomicPtr<QueueNode<T>>,
 }
+
+#[repr(transparent)]
+pub struct QueueNode<T>(Node<T>);
 
 impl<T> MSQueue<T>
 where
@@ -23,7 +26,7 @@ where
         let dummy_node = Box::into_raw(Box::new(Node {
             data: T::default(),
             next: AtomicPtr::new(ptr::null_mut()),
-        }));
+        })) as * mut QueueNode<T>;
         MSQueue {
             head: AtomicPtr::new(dummy_node),
             tail: AtomicPtr::new(dummy_node),
@@ -31,15 +34,15 @@ where
     }
 
     // user should register thread to obtain guard
-    pub fn enqueue(&self, value: T, guard: &HazardPointerGuard<Node<T>>) -> bool {
+    pub fn enqueue(&self, value: T, guard: &HazardPointerGuard<QueueNode<T>>) -> bool {
         let mut backoff = Backoff::new();
 
         let new_node = Box::into_raw(Box::new(Node {
             data: value,
             next: AtomicPtr::new(ptr::null_mut()),
-        }));
+        })) as * mut QueueNode<T>;
 
-        let mut tail_ptr = std::mem::MaybeUninit::<*mut Node<T>>::uninit();
+        let mut tail_ptr = std::mem::MaybeUninit::<*mut QueueNode<T>>::uninit();
 
         loop {
             tail_ptr.write(self.tail.load(Ordering::Relaxed));
@@ -55,7 +58,7 @@ where
             };
 
             // first, check if tail is located correctly
-            let tail_next = (*protected_tail).next.load(Ordering::Acquire);
+            let tail_next = (*protected_tail).0.next.load(Ordering::Acquire);
             if tail_next != ptr::null_mut() {
                 _ = self.tail.compare_exchange_weak(
                     protected_tail.as_mut_ptr(),
@@ -68,6 +71,7 @@ where
             }
 
             if (*protected_tail)
+                .0
                 .next
                 .compare_exchange_weak(
                     ptr::null_mut(),
@@ -91,11 +95,11 @@ where
     }
 
     // user should register thread to obtain guard
-    pub fn dequeue(&self, guard: &HazardPointerGuard<Node<T>>) -> Option<T> {
+    pub fn dequeue(&self, guard: &HazardPointerGuard<QueueNode<T>>) -> Option<T> {
         let mut backoff = Backoff::new();
 
-        let mut head_ptr = std::mem::MaybeUninit::<*mut Node<T>>::uninit();
-        let mut head_next = std::mem::MaybeUninit::<*mut Node<T>>::uninit();
+        let mut head_ptr = std::mem::MaybeUninit::<*mut QueueNode<T>>::uninit();
+        let mut head_next = std::mem::MaybeUninit::<*mut QueueNode<T>>::uninit();
 
         loop {
             head_ptr.write(self.head.load(Ordering::Relaxed));
@@ -112,14 +116,14 @@ where
                 Err(ProtectionError::NullPointer) => return None,
             };
 
-            head_next.write(unsafe { (*protected_head).next.load(Ordering::Relaxed) });
+            head_next.write((*protected_head).0.next.load(Ordering::Relaxed));
             let mut protected_head_next =
                 match unsafe { guard.protect(head_next.assume_init_read()) } {
                     Ok(ptr) => {
                         fence(Ordering::Acquire);
                         ptr
                     }
-                    Err(_) => {
+                    Err(ProtectionError::NoAvailableIndices) => {
                         backoff.spin();
                         continue; // no hazard pointer slots available, retry
                     }
@@ -163,7 +167,7 @@ where
                     break;
                 }
                 guard.retire_node(protected_head);
-                return Some(std::mem::take(&mut (*protected_head_next).data));
+                return Some(std::mem::take(&mut (*protected_head_next).0.data));
             }
         }
     }

@@ -28,7 +28,9 @@ impl Backoff {
         for _ in 0..self.current {
             std::hint::spin_loop();
         }
-        self.current = (self.current << 1) & (self.threshold - 1);
+        if self.current < self.threshold {
+            self.current <<= 1;
+        }
     }
 
     pub(crate) fn reset(&mut self) {

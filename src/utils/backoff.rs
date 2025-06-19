@@ -32,6 +32,18 @@ impl Backoff {
             self.current <<= 1;
         }
     }
+    
+    pub(crate) fn spin_yield(&mut self) {
+        if self.current == self.threshold {
+            self.reset();
+            std::thread::yield_now();
+            return;
+        }
+        for _ in 0..self.current {
+            std::hint::spin_loop();
+        }
+        self.current <<= 1;
+    }
 
     pub(crate) fn reset(&mut self) {
         self.current = self.initial;

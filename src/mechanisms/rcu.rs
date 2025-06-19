@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use crate::utils::backoff::Backoff;
 
 static CONTROL_BIT: usize = 1;
 static RCU_ID: AtomicUsize = AtomicUsize::new(1);
@@ -35,11 +36,10 @@ pub struct Rcu<T: Sync> {
         a guard with a dangling pointer. to rule out this risk, we delay previous pointer
         reclamation to the next synchronize() invocation
     */
-    previous_ptr: *mut T,
+    previous_ptr: RefCell<*mut T>,
     rcu_id: usize,
     // reading threads counters for both rcu epochs
     readers: [AtomicUsize; 2],
-    is_writing: AtomicBool,
 }
 
 impl<T: Sync> Rcu<T> {
@@ -49,10 +49,9 @@ impl<T: Sync> Rcu<T> {
         let data_ptr = Box::into_raw(Box::new(data));
         Rcu {
             ptr_and_epoch: AtomicPtr::new(data_ptr),
-            previous_ptr: ptr::null_mut(),
+            previous_ptr: RefCell::new(ptr::null_mut()),
             rcu_id: id,
             readers: [const { AtomicUsize::new(0) }; 2],
-            is_writing: AtomicBool::new(false),
         }
     }
 
@@ -79,31 +78,86 @@ impl<T: Sync> Rcu<T> {
         }
     }
     pub fn update(&self, data: T) {
-        while self
-            .is_writing
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            // todo: backoff strategy (spin + park/futex-wait? .. )
-        }
-        let epoch =
-            (self.ptr_and_epoch.load(Ordering::Relaxed) as usize & CONTROL_BIT) ^ CONTROL_BIT;
-        self.synchronize(epoch);
         let new_data_ptr = Box::into_raw(Box::new(data));
-        let packed_ptr_and_epoch = (new_data_ptr as usize | epoch) as *mut T;
-        self.ptr_and_epoch
-            .store(packed_ptr_and_epoch, Ordering::Release);
-
-        self.is_writing.store(false, Ordering::Release);
+        let mut backoff = Backoff::new();
+        
+        loop {
+            let current_ptr_and_epoch = self.ptr_and_epoch.load(Ordering::Acquire);
+            let next_epoch = (current_ptr_and_epoch as usize & CONTROL_BIT) ^ CONTROL_BIT;
+            let current_ptr = (current_ptr_and_epoch as usize & !CONTROL_BIT) as *mut T;
+            
+            self.synchronize(next_epoch, current_ptr);
+            
+            let new_ptr_and_epoch = (new_data_ptr as usize | next_epoch) as *mut T;
+            
+            match self.ptr_and_epoch.compare_exchange(
+                current_ptr_and_epoch,
+                new_ptr_and_epoch,
+                Ordering::Release,
+                Ordering::Relaxed
+            ) {
+                Ok(_) => {
+                    break;
+                },
+                Err(_) => {
+                    backoff.spin_yield();
+                    continue;
+                }
+            } 
+        }
+    }
+    
+    pub fn try_update(&self, data: T) -> bool {
+        let current_ptr_and_epoch = self.ptr_and_epoch.load(Ordering::Acquire);
+        let next_epoch = (current_ptr_and_epoch as usize & CONTROL_BIT) ^ CONTROL_BIT;
+        let current_ptr = (current_ptr_and_epoch as usize & !CONTROL_BIT) as *mut T;
+        if !self.try_synchronize(next_epoch, current_ptr) {
+            return false;
+        }
+        
+        let new_data_ptr = Box::into_raw(Box::new(data));
+        let packed_ptr_and_epoch = (new_data_ptr as usize | next_epoch) as *mut T;
+        match self.ptr_and_epoch.compare_exchange(
+            current_ptr_and_epoch,
+            packed_ptr_and_epoch, 
+            Ordering::Release,
+            Ordering::Relaxed
+        ) {
+            Ok(_) => { true },
+            Err(_) => {
+                unsafe { drop(Box::from_raw(new_data_ptr)) };
+                false
+            }
+        }
+        
     }
 
-    fn synchronize(&self, sync_epoch: usize) {
-        if !self.previous_ptr.is_null() {
-            while self.readers[sync_epoch].load(Ordering::Acquire) != 0 {
-                //todo: backoff strategy (spin + yield?)
-            }
-            unsafe { drop(Box::from_raw(self.previous_ptr)) };
+    fn synchronize(&self, sync_epoch: usize, ptr: *mut T) {
+        let mut backoff = Backoff::new();
+
+        // wait for readers of sync_epoch to finish
+        while self.readers[sync_epoch].load(Ordering::Acquire) != 0 {
+            backoff.spin_yield();
         }
+
+        let previous_ptr = self.previous_ptr.replace(ptr);
+
+        // someone could have already succeeded with synchronization
+        // free if we have a previous pointer and it's different from current
+        if !previous_ptr.is_null() && previous_ptr != ptr {
+            unsafe { drop(Box::from_raw(previous_ptr)) };
+        }
+    }
+
+    fn try_synchronize(&self, sync_epoch: usize, ptr: *mut T) -> bool  {
+        if self.readers[sync_epoch].load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        let previous_ptr = self.previous_ptr.replace(ptr);
+        if !previous_ptr.is_null() && previous_ptr != ptr {
+            unsafe { drop(Box::from_raw(previous_ptr)) };
+        }
+        true
     }
 }
 
@@ -151,12 +205,14 @@ impl<'a, T: Sync> Drop for RcuReadGuard<'a, T> {
 
 impl<T: Sync> Drop for Rcu<T> {
     fn drop(&mut self) {
-        let ptr = self.ptr_and_epoch.load(Ordering::Acquire);
+        let ptr = (self.ptr_and_epoch.load(Ordering::Acquire) as usize & !CONTROL_BIT) as *mut T;
         // this is safe, because RcuReadGuards, providing a reference to underlying data
         // wouldn't outlive rcu
         if !ptr.is_null() {
-            unsafe {
-                drop(Box::from_raw(ptr));
+            unsafe { drop(Box::from_raw(ptr)); }
+            let prev_ptr = self.previous_ptr.replace(ptr::null_mut());
+            if !prev_ptr.is_null() {
+                unsafe {drop(Box::from_raw(prev_ptr)); }
             }
         }
     }
